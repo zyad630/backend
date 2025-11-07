@@ -23,7 +23,15 @@ app.use(helmet());
 app.use(cors({
   origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'x-api-key',
+    'Accept',
+    'Accept-Language',
+    'X-Requested-With',
+    'X-Request-ID'
+  ],
   exposedHeaders: ['Content-Type'],
   credentials: false
 }));
