@@ -111,6 +111,7 @@ const DB_FILE = process.env.DB_FILE || path.join(__dirname, "data.db");
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const WHATSAPP_PHONE_ID = process.env.WHATSAPP_PHONE_ID;
 const WHATSAPP_VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
+const DEFAULT_WHATSAPP_TO = process.env.DEFAULT_WHATSAPP_TO; // optional: force all sends to this E.164 digits-only number
 
 if (!API_KEY) {
   console.error('FATAL: API_KEY is not defined in environment variables');
@@ -196,6 +197,16 @@ let db;
 })();
 
 // Helper to check API key already exists: checkApiKey
+
+// Normalize E.164-like phone: remove spaces/+; if starts with '00' convert to international by removing '00'
+function normalizePhone(input) {
+  if (!input) return input;
+  let p = String(input).trim();
+  p = p.replace(/\s+/g, '');
+  if (p.startsWith('+')) p = p.slice(1);
+  if (p.startsWith('00')) p = p.slice(2);
+  return p;
+}
 
 // WhatsApp helper
 async function sendWhatsApp(to, text) {
@@ -327,9 +338,13 @@ app.post("/api/tasks/:id/status", checkApiKey, async (req, res) => {
 // WhatsApp send endpoint
 app.post("/api/whatsapp/send", checkApiKey, async (req, res) => {
   const { phone, message } = req.body || {};
-  if (!phone || !message) return res.status(400).json({ success: false, error: "phone & message required" });
+  if ((!phone && !DEFAULT_WHATSAPP_TO) || !message) return res.status(400).json({ success: false, error: "phone & message required" });
   try {
-    await sendWhatsApp(phone, message);
+    const target = normalizePhone(DEFAULT_WHATSAPP_TO || phone);
+    if (!/^\d{10,15}$/.test(target)) {
+      return res.status(400).json({ success: false, error: "Invalid phone format (use E.164 digits, e.g. 2010xxxxxxx)" });
+    }
+    await sendWhatsApp(target, message);
     res.json({ success: true });
   } catch (err) {
     console.error("whatsapp send error:", err?.response?.data || err.message);
@@ -564,38 +579,35 @@ app.post(
 app.get("/api/meetings", checkApiKey, async (req, res) => {
   try {
     const { startDate, endDate, status, includeDeleted } = req.query;
-    
-    // Only include non-deleted items by default
-    let whereClause = "WHERE deleted_at IS NULL";
-    const params = [];
-    
-    // If specifically requesting deleted items
-    if (includeDeleted === 'true') {
-      whereClause = "WHERE deleted_at IS NOT NULL";
-    } else if (includeDeleted === 'all') {
-      // Show all items (including deleted) - useful for admin views
-      whereClause = "";
-    }
 
-    const clauses = [];
-    if (whereClause) {
-      clauses.push(whereClause);
+    // Build conditions without embedding the WHERE keyword to avoid duplication
+    const conditions = [];
+    const params = [];
+
+    // deleted_at filtering
+    if (includeDeleted === 'true') {
+      conditions.push("deleted_at IS NOT NULL");
+    } else if (includeDeleted === 'all') {
+      // no condition -> include all
+    } else {
+      // default: only non-deleted
+      conditions.push("deleted_at IS NULL");
     }
 
     if (startDate) {
-      clauses.push("date >= ?");
+      conditions.push("date >= ?");
       params.push(startDate);
     }
     if (endDate) {
-      clauses.push("date <= ?");
+      conditions.push("date <= ?");
       params.push(endDate);
     }
     if (status) {
-      clauses.push("status = ?");
+      conditions.push("status = ?");
       params.push(status);
     }
 
-    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
     const rows = await db.all(`SELECT * FROM meetings ${where} ORDER BY date ASC, time ASC`, params);
     res.json(rows);
   } catch (e) {
