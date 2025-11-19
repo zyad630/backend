@@ -1,6 +1,7 @@
 // server.js
 import express from "express";
 import bodyParser from "body-parser";
+import crypto from "crypto";
 import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
@@ -21,6 +22,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 
 // Security Middleware
+// Behind Railway/NGINX proxies, trust first proxy to read X-Forwarded-For safely
+app.set('trust proxy', 1);
 app.use(helmet());
 app.use(cors({
   origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : '*',
@@ -40,7 +43,12 @@ app.use(cors({
 
 // Handle preflight requests
 app.options('*', cors());
-app.use(bodyParser.json({ limit: '10kb' }));
+app.use(bodyParser.json({
+  limit: '10kb',
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
+  }
+}));
 app.use(express.urlencoded({ extended: true, limit: '10kb' }));
 
 // Rate limiting
@@ -67,6 +75,28 @@ app.delete("/api/meetings/:id", checkApiKey, async (req, res) => {
   } catch (e) {
     console.error('Error soft deleting meeting:', e);
     res.status(500).json({ success: false, error: 'خطأ أثناء حذف الموعد' });
+  }
+});
+
+// Send structured reminder for a specific task id using tiered templates
+app.post("/api/tasks/:id/remind", checkApiKey, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const task = await db.get(`SELECT t.*, s.name AS student_name, s.phone AS student_phone FROM tasks t JOIN students s ON s.id = t.student_id WHERE t.id = ?`, [id]);
+    if (!task) return res.status(404).json({ success: false, error: 'TASK_NOT_FOUND' });
+    if (!task.student_phone) return res.status(400).json({ success: false, error: 'TASK_PHONE_MISSING' });
+
+    const currentCount = Number(task.reminder_count || 0);
+    const text = buildReminderText(task.student_name, task.task, currentCount);
+
+    await sendWhatsApp(task.student_phone, text);
+    const nowIso = new Date().toISOString();
+    await db.run(`UPDATE tasks SET last_followup_at = ?, reminder_count = ? WHERE id = ?`, [nowIso, currentCount + 1, id]);
+    const updated = await db.get(`SELECT * FROM tasks WHERE id = ?`, [id]);
+    return res.json({ success: true, data: updated });
+  } catch (e) {
+    console.error('remind task error', e?.response?.data || e.message);
+    return res.status(502).json({ success: false, error: 'FAILED_TO_SEND_WHATSAPP' });
   }
 });
 
@@ -102,6 +132,17 @@ app.delete("/api/meetings/:id/permanent", checkApiKey, async (req, res) => {
     res.status(500).json({ success: false, error: 'خطأ أثناء الحذف النهائي للموعد' });
   }
 });
+
+// تفريغ سلة المحذوفات (حذف جميع المواعيد المحذوفة نهائياً)
+app.post("/api/meetings/empty-trash", checkApiKey, async (req, res) => {
+  try {
+    await db.run("DELETE FROM meetings WHERE deleted_at IS NOT NULL");
+    res.json({ success: true });
+  } catch (e) {
+    console.error('Error emptying trash:', e);
+    res.status(500).json({ success: false, error: 'خطأ أثناء تفريغ سلة المحذوفات' });
+  }
+});
 app.use(limiter);
 
 // Environment variables
@@ -112,6 +153,9 @@ const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const WHATSAPP_PHONE_ID = process.env.WHATSAPP_PHONE_ID;
 const WHATSAPP_VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
 const DEFAULT_WHATSAPP_TO = process.env.DEFAULT_WHATSAPP_TO; // optional: force all sends to this E.164 digits-only number
+const WHATSAPP_TEMPLATE_NAME = process.env.WHATSAPP_TEMPLATE_NAME || null;
+const WHATSAPP_TEMPLATE_LANG = process.env.WHATSAPP_TEMPLATE_LANG || 'en_US';
+const APP_SECRET = process.env.APP_SECRET || null;
 
 if (!API_KEY) {
   console.error('FATAL: API_KEY is not defined in environment variables');
@@ -167,6 +211,29 @@ let db;
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(student_id) REFERENCES students(id)
     );
+
+    CREATE TABLE IF NOT EXISTS messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      direction TEXT, -- in | out
+      phone TEXT,
+      type TEXT, -- text/template
+      body TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS whatsapp_sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      phone TEXT,
+      step TEXT,
+      service TEXT,
+      person TEXT,
+      date TEXT,
+      time TEXT,
+      location TEXT,
+      notes TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT
+    );
   `);
 
   // Migrate existing table to include missing columns
@@ -186,6 +253,13 @@ let db;
   await addCol('completed_at', 'TEXT');
   await addCol('deleted_at', 'TEXT');
   await addCol('todoist_task_id', 'TEXT');
+
+  // ensure tasks has reminder_count column
+  const taskCols = await db.all(`PRAGMA table_info(tasks)`);
+  const taskColNames = new Set(taskCols.map(c => c.name));
+  if (!taskColNames.has('reminder_count')) {
+    await db.exec(`ALTER TABLE tasks ADD COLUMN reminder_count INTEGER DEFAULT 0`);
+  }
 
   console.log("✅ Database ready.");
 
@@ -232,17 +306,54 @@ async function sendWhatsApp(to, text) {
         timeout: 15000
       });
       if (attempt > 1) console.info(`[whatsapp] sent after retry x${attempt - 1} -> ${to}`);
+      // Log outbound message
+      try { await db.run(`INSERT INTO messages (direction, phone, type, body) VALUES ('out', ?, 'text', ?)`, [to, text]); } catch (e) {}
       return;
     } catch (err) {
       lastErr = err;
       const code = err?.response?.status;
       const data = err?.response?.data;
       console.warn(`[whatsapp] send attempt ${attempt} failed`, code || '', data || err.message);
+      // Fallback: try template once if session closed and template is configured
+      const canTemplate = !!WHATSAPP_TEMPLATE_NAME;
+      const isSessionClosed = code === 400 || code === 470 || (data?.error?.code === 470);
+      if (attempt === 1 && canTemplate && isSessionClosed) {
+        try {
+          const tUrl = `https://graph.facebook.com/v17.0/${WHATSAPP_PHONE_ID}/messages`;
+          const tBody = {
+            messaging_product: "whatsapp",
+            to,
+            type: "template",
+            template: { name: WHATSAPP_TEMPLATE_NAME, language: { code: WHATSAPP_TEMPLATE_LANG } }
+          };
+          await axios.post(tUrl, tBody, {
+            headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, "Content-Type": "application/json" },
+            timeout: 15000
+          });
+          try { await db.run(`INSERT INTO messages (direction, phone, type, body) VALUES ('out', ?, 'template', ?)`, [to, WHATSAPP_TEMPLATE_NAME]); } catch (e) {}
+          return;
+        } catch (te) {
+          console.warn('[whatsapp] template fallback failed', te?.response?.status || '', te?.response?.data || te.message);
+        }
+      }
       // simple backoff
       await new Promise(r => setTimeout(r, 500 * attempt));
     }
   }
   throw lastErr || new Error('sendWhatsApp failed');
+}
+
+// Helper: reminder text templates based on reminder_count (0 = first reminder)
+function buildReminderText(studentName, task, reminderCount) {
+  const name = studentName || 'صديقي';
+  const baseTask = task || 'المهمة المطلوبة';
+  if (reminderCount <= 0) {
+    return `مرحبًا ${name} 👋\nهذا تذكير لطيف بالمهمة: "${baseTask}".\nهل قمت بإنجازها؟ رجاءً رد بـ نعم أو لا. شكرًا لك.`;
+  }
+  if (reminderCount === 1) {
+    return `مرحبًا مرة أخرى ${name} 😊\nنذكّرك بالمهمة: "${baseTask}".\nإذا أنجزتها رد بـ نعم، وإذا احتجت وقتًا إضافيًا أخبرنا.`;
+  }
+  return `${name} العزيز، هذا تذكير إضافي بالمهمة: "${baseTask}".\nنحن نهتم بتقدمك، فضلاً أخبرنا هل أنهيتها أم لا.`;
 }
 
 // GET webhook verification for Meta
@@ -293,11 +404,23 @@ app.post("/api/assignTask", checkApiKey, async (req, res) => {
       sid = insertStudent.lastID;
     }
 
+    // send initial assignment message first; if it fails, abort assignment
+    if (normPhone) {
+      const msg = `مرحبًا ${name || 'صديق'}، تم تعيين مهمة لك: "${task}". من فضلك رد بـ نعم إذا أنجزتها أو لا إن لم تنجزها.`;
+      try {
+        await sendWhatsApp(normPhone, msg);
+      } catch (e) {
+        console.error("assignTask send error", e?.response?.data || e.message);
+        return res.status(502).json({ success: false, error: 'FAILED_TO_SEND_WHATSAPP' });
+      }
+    }
+
     const r = await db.run(
       `INSERT INTO tasks (student_id, task, followup_interval_hours, status, last_followup_at) VALUES (?, ?, ?, 'pending', ?)`,
       [sid, task, fh, new Date().toISOString()]
     );
     const newTask = await db.get(`SELECT * FROM tasks WHERE id = ?`, [r.lastID]);
+
     return res.json({ success: true, data: newTask });
   } catch (e) {
     console.error("assignTask error", e);
@@ -317,6 +440,30 @@ app.get("/api/tasks", checkApiKey, async (req, res) => {
   } catch (e) {
     console.error("tasks list error", e);
     res.status(500).json({ success: false, error: "SERVER_ERROR" });
+  }
+});
+
+// List WhatsApp messages (in/out) with optional filters
+app.get("/api/messages", checkApiKey, async (req, res) => {
+  try {
+    const { phone, direction, limit = 100 } = req.query;
+    const conds = [];
+    const params = [];
+    if (phone) {
+      conds.push("phone = ?");
+      params.push(String(phone));
+    }
+    if (direction && (direction === 'in' || direction === 'out')) {
+      conds.push("direction = ?");
+      params.push(direction);
+    }
+    const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+    const lim = Math.max(1, Math.min(Number(limit) || 100, 500));
+    const rows = await db.all(`SELECT * FROM messages ${where} ORDER BY created_at DESC LIMIT ?`, [...params, lim]);
+    res.json({ success: true, data: rows });
+  } catch (e) {
+    console.error('messages list error', e);
+    res.status(500).json({ success: false, error: 'SERVER_ERROR' });
   }
 });
 
@@ -355,6 +502,12 @@ app.post("/api/whatsapp/send", checkApiKey, async (req, res) => {
 // WhatsApp webhook receive
 app.post("/api/whatsapp/webhook", async (req, res) => {
   try {
+    if (APP_SECRET) {
+      const sig = req.headers['x-hub-signature-256'];
+      if (!sig) return res.sendStatus(401);
+      const expected = 'sha256=' + crypto.createHmac('sha256', APP_SECRET).update(req.rawBody || Buffer.from('')).digest('hex');
+      if (sig !== expected) return res.sendStatus(401);
+    }
     const entry = req.body.entry?.[0];
     const changes = entry?.changes?.[0];
     const value = changes?.value;
@@ -365,16 +518,151 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
     const text = message.text?.body || "";
     console.info(`[webhook] msg from ${from}: ${text}`);
 
+     // Log inbound message
+    try { await db.run(`INSERT INTO messages (direction, phone, type, body) VALUES ('in', ?, 'text', ?)`, [from, text]); } catch (e) {}
+    const low = text.trim().toLowerCase();
+
+    const session = await db.get(
+      `SELECT * FROM whatsapp_sessions WHERE phone = ? ORDER BY id DESC LIMIT 1`,
+      [from]
+    );
+
+    if (low.includes('الغاء') || low.includes('إلغاء') || low.includes('cancel')) {
+      if (session) {
+        await db.run(`DELETE FROM whatsapp_sessions WHERE id = ?`, [session.id]);
+      }
+      await sendWhatsApp(from, "تم إلغاء عملية الحجز الحالية.");
+      return res.sendStatus(200);
+    }
+
+    if (!session) {
+      const bookingIntent = [
+        'حجز',
+        'ميتنج',
+        'meeting',
+        'موعد',
+        'ميعاد',
+        'استشارة',
+        'consult'
+      ].some(w => low.includes(w));
+
+      if (bookingIntent) {
+        const nowIso = new Date().toISOString();
+        await db.run(
+          `INSERT INTO whatsapp_sessions (phone, step, created_at, updated_at) VALUES (?, ?, ?, ?)`,
+          [from, 'ask_service', nowIso, nowIso]
+        );
+        await sendWhatsApp(from, "أهلاً بك 👋\nمن فضلك اكتب نوع الخدمة أو السبب الذى تريد الحجز من أجله.");
+        return res.sendStatus(200);
+      }
+    }
+
+    if (session) {
+      const nowIso = new Date().toISOString();
+      let step = session.step || 'ask_service';
+      let service = session.service;
+      let person = session.person;
+      let date = session.date;
+      let time = session.time;
+      let location = session.location;
+
+      if (step === 'ask_service') {
+        service = text.trim();
+        step = 'ask_person';
+        await db.run(
+          `UPDATE whatsapp_sessions SET service = ?, step = ?, updated_at = ? WHERE id = ?`,
+          [service, step, nowIso, session.id]
+        );
+        await sendWhatsApp(from, "تمام ✅\nاكتب اسم الشخص الذى سيتم الحجز له.");
+        return res.sendStatus(200);
+      }
+
+      if (step === 'ask_person') {
+        person = text.trim();
+        step = 'ask_date';
+        await db.run(
+          `UPDATE whatsapp_sessions SET person = ?, step = ?, updated_at = ? WHERE id = ?`,
+          [person, step, nowIso, session.id]
+        );
+        await sendWhatsApp(from, "اكتب تاريخ الموعد المطلوب بصيغة مثل: 2025-12-31");
+        return res.sendStatus(200);
+      }
+
+      if (step === 'ask_date') {
+        date = text.trim();
+        step = 'ask_time';
+        await db.run(
+          `UPDATE whatsapp_sessions SET date = ?, step = ?, updated_at = ? WHERE id = ?`,
+          [date, step, nowIso, session.id]
+        );
+        await sendWhatsApp(from, "اكتب وقت الموعد بصيغة 24 ساعة مثل: 14:30");
+        return res.sendStatus(200);
+      }
+
+      if (step === 'ask_time') {
+        time = text.trim();
+        step = 'ask_location';
+        await db.run(
+          `UPDATE whatsapp_sessions SET time = ?, step = ?, updated_at = ? WHERE id = ?`,
+          [time, step, nowIso, session.id]
+        );
+        await sendWhatsApp(from, "لو في مكان معين للموعد اكتبه الآن، أو اكتب لا يوجد.");
+        return res.sendStatus(200);
+      }
+
+      if (step === 'ask_location') {
+        location = text.trim().includes('لا يوجد') ? null : text.trim();
+
+        const statusArabic = 'قيد الانتظار';
+        const isArchived = 0;
+        const createdAt = nowIso;
+        const updatedAt = nowIso;
+        const completedAt = null;
+        const todoistId = null;
+
+        await db.run(
+          `INSERT INTO meetings 
+            (name, service, person, phone, location, notes, priority, date, time, status, is_archived, created_at, updated_at, completed_at, todoist_task_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            null,
+            session.service,
+            session.person,
+            from,
+            location,
+            session.notes || null,
+            null,
+            session.date,
+            session.time,
+            statusArabic,
+            isArchived,
+            createdAt,
+            updatedAt,
+            completedAt,
+            todoistId
+          ]
+        );
+
+        await db.run(`DELETE FROM whatsapp_sessions WHERE id = ?`, [session.id]);
+
+        await sendWhatsApp(
+          from,
+          `تم حجز الموعد بنجاح ✅\nالخدمة: ${session.service}\nالاسم: ${session.person}\nالتاريخ: ${session.date}\nالوقت: ${session.time}`
+        );
+        return res.sendStatus(200);
+      }
+    }
+
     let newStatus = null;
     let note = null;
-    const low = text.trim().toLowerCase();
     if (["نعم","yes","تمام","خلصت","تم"].some(w => low.includes(w))) {
       newStatus = "done";
+      note = text || "تأكيد من المستخدم";
     } else if (["لا","not","no","مش","لأ"].some(w => low.includes(w))) {
       newStatus = "failed";
-      note = text;
+      note = text || "رد سلبى من المستخدم";
     } else {
-      note = text;
+      note = text || "رسالة عامة من المستخدم";
     }
 
     const task = await db.get(
@@ -388,12 +676,17 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
       } else {
         await db.run(`UPDATE tasks SET note = ? WHERE id = ?`, [note, task.id]);
       }
+      // hours are managed from dashboard only; do not parse numbers from messages
     } else {
       const st = await db.run(`INSERT INTO students (name, phone) VALUES (?, ?)`, ["whatsapp_user", from]);
       await db.run(`INSERT INTO tasks (student_id, task, status, note) VALUES (?, ?, ?, ?)`, [st.lastID, "message from user", newStatus || "pending", note]);
     }
 
-    await sendWhatsApp(from, "تم تسجيل ردك، شكرًا 👍");
+    const genericReply = newStatus
+      ? "تم تحديث حالتك لدينا، شكرًا على ردك 🤝"
+      : "شكرًا لرسالتك 🌟\nتم استلام استفسارك وسيتم التواصل معك أو متابعة الطلب في أقرب وقت ممكن.";
+
+    await sendWhatsApp(from, genericReply);
     res.sendStatus(200);
   } catch (e) {
     console.error("webhook error", e?.response?.data || e.message);
