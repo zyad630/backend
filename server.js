@@ -536,15 +536,27 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
     }
 
     if (!session) {
-      const bookingIntent = [
+      // Detect booking intent with broader phrases (doctor/teacher/session/etc.)
+      const bookingKeywords = [
         'حجز',
         'ميتنج',
         'meeting',
         'موعد',
         'ميعاد',
         'استشارة',
-        'consult'
-      ].some(w => low.includes(w));
+        'consult',
+        'دكتور',
+        'طبيب',
+        'مدرس',
+        'استاذ',
+        'محاضرة',
+        'جلسة',
+        'سيشن',
+        'lecture',
+        'session',
+      ];
+
+      const bookingIntent = bookingKeywords.some(w => low.includes(w));
 
       if (bookingIntent) {
         const nowIso = new Date().toISOString();
@@ -552,7 +564,10 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
           `INSERT INTO whatsapp_sessions (phone, step, created_at, updated_at) VALUES (?, ?, ?, ?)`,
           [from, 'ask_service', nowIso, nowIso]
         );
-        await sendWhatsApp(from, "أهلاً بك 👋\nمن فضلك اكتب نوع الخدمة أو السبب الذى تريد الحجز من أجله.");
+        await sendWhatsApp(
+          from,
+          "أهلاً بك 👋\nتمام، هنظبط لك ميعاد مناسب. اكتب لي نوع الخدمة أو السبب اللي حابب تحجز علشانه (مثلاً: استشارة، درس، متابعة...)."
+        );
         return res.sendStatus(200);
       }
     }
@@ -655,14 +670,14 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
 
     let newStatus = null;
     let note = null;
+    const low = text.trim().toLowerCase();
     if (["نعم","yes","تمام","خلصت","تم"].some(w => low.includes(w))) {
       newStatus = "done";
-      note = text || "تأكيد من المستخدم";
     } else if (["لا","not","no","مش","لأ"].some(w => low.includes(w))) {
       newStatus = "failed";
-      note = text || "رد سلبى من المستخدم";
+      note = text;
     } else {
-      note = text || "رسالة عامة من المستخدم";
+      note = text;
     }
 
     const task = await db.get(
@@ -682,11 +697,43 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
       await db.run(`INSERT INTO tasks (student_id, task, status, note) VALUES (?, ?, ?, ?)`, [st.lastID, "message from user", newStatus || "pending", note]);
     }
 
-    const genericReply = newStatus
-      ? "تم تحديث حالتك لدينا، شكرًا على ردك 🤝"
-      : "شكرًا لرسالتك 🌟\nتم استلام استفسارك وسيتم التواصل معك أو متابعة الطلب في أقرب وقت ممكن.";
+    // Simple rule-based auto-replies for general conversation (more natural tone + wider vocabulary)
+    let reply = null;
+    const lowAr = text.trim();
 
-    await sendWhatsApp(from, genericReply);
+    // Intent flags
+    const hasThanks = /\b(شكرا|شُكْرًا|شكرًا|thx|thanx|thanks|thank you)\b/i.test(lowAr);
+    const hasHello = /(السلام عليكم|عليكم السلام|ازيك|ازاىك|اهلا|أهلا|يا دكتور|يا دكتور|مرحبا|هلا|hello|hi|hey)/i.test(lowAr);
+    const hasAppt = /(ميعاد|موعد|حجز|معاد|دكتور|طبيب|مدرس|استاذ|أستاذ|جلسة|سيشن|lecture|lesson|class|session|meeting)/i.test(lowAr);
+    const hasPrice = /(سعر|ثمن|price|تكلفة|كام|كم سعر|بكام|بقد ايه)/i.test(lowAr);
+    const hasApology = /(اسف|آسف|متأسف|عذرًا|عذرا|sorry|my bad)/i.test(lowAr);
+    const hasUrgent = /(ضروري|مهم|مستعجل|عاجل|important|urgent)/i.test(lowAr);
+    const hasConfused = /(مش فاهم|مش واضح|مش مفهوم|مش عارف|help|ساعدني|محتاج مساعدة|عايز افهم)/i.test(lowAr);
+
+    if (hasThanks && !hasAppt && !hasPrice) {
+      reply = "العفو 🤍 يسعدنا وجودك دايمًا. لو احتجت أي مساعدة أو حابب تحجز ميعاد، كلمني في أي وقت.";
+    } else if (hasApology) {
+      reply = "ولا يهمك خالص 😊\nإحنا موجودين عشان نساعدك، احكيلي بهدوء محتاج إيه أو حابب نرجع من الأول.";
+    } else if (hasHello && !hasAppt && !hasPrice) {
+      reply = "أهلاً وسهلاً 👋\nأنا معاك هنا، تحب تسأل عن إيه أو تحجز معاد مع مين؟";
+    } else if (hasAppt) {
+      reply = "تمام، فهمت إنك حابب تحجز معاد أو جلسة 😊\nاكتب لي اليوم والتوقيت اللي يناسبك، أو نوع الجلسة (مثلاً: استشارة، درس، متابعة)، وهنتابع معاك.";
+    } else if (hasPrice) {
+      reply = "بالنسبة للأسعار فهي بتختلف حسب نوع الخدمة والجلسة وعدد المرات 👌\nهنراجع طلبك ونتواصل معاك بأقرب وقت بكل التفاصيل والسعر الأنسب ليك.";
+    } else if (hasUrgent) {
+      reply = "شايف إن الموضوع مهم بالنسبة لك 👍\nهنتابع رسالتك بأولوية، ولو تحب وضّحلي بسرعة أنت محتاج إيه بالظبط عشان نساعدك أسرع.";
+    } else if (hasConfused) {
+      reply = "تمام، خلينا نبسّط الدنيا شوية 😊\nاكتب لي بس: حابب تحجز معاد؟ ولا عندك سؤال عن خدمة أو عن مهمة متابعة معينة؟";
+    } else if (newStatus === "done") {
+      reply = "جميل جدًا 👏\nسجلت عندي إنك خلّصت المهمة، واستمر على نفس المستوى الممتاز. لو في مهمة جديدة حابب تضيفها قول لي.";
+    } else if (newStatus === "failed") {
+      reply = "شكرًا إنك وضحت الموقف 🙏\nمفيش مشكلة خالص، نقدر نعدّل الخطة أو نغيّر أسلوب المتابعة عشان يناسبك أكتر.";
+    } else {
+      // Default friendly fallback when no specific intent is detected
+      reply = "تمام، وصلت رسالتك 👍\nاحكيلي شوية أكتر: حابب تحجز ميعاد، تسأل عن الأسعار، ولا عندك استفسار عن مهمة أو خدمة معينة؟";
+    }
+
+    await sendWhatsApp(from, reply);
     res.sendStatus(200);
   } catch (e) {
     console.error("webhook error", e?.response?.data || e.message);
