@@ -156,6 +156,7 @@ const DEFAULT_WHATSAPP_TO = process.env.DEFAULT_WHATSAPP_TO; // optional: force 
 const WHATSAPP_TEMPLATE_NAME = process.env.WHATSAPP_TEMPLATE_NAME || null;
 const WHATSAPP_TEMPLATE_LANG = process.env.WHATSAPP_TEMPLATE_LANG || 'en_US';
 const APP_SECRET = process.env.APP_SECRET || null;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
 
 if (!API_KEY) {
   console.error('FATAL: API_KEY is not defined in environment variables');
@@ -341,6 +342,55 @@ async function sendWhatsApp(to, text) {
     }
   }
   throw lastErr || new Error('sendWhatsApp failed');
+}
+
+// Helper: ask ChatGPT-like assistant for natural Arabic replies
+async function askChatAssistant(userText, extraContext = '') {
+  if (!OPENAI_API_KEY) {
+    throw new Error('OPENAI_API_KEY missing');
+  }
+
+  const prompt = `
+انت سكرتير شخصي لمركز تعليمي على واتساب.
+- تتكلم عربي طبيعي وبسيط (مصري خفيف)، من غير تكلف ولا أسلوب روبوت.
+- ردودك تكون كأنك واحد صاحب بيتكلم مع صاحبه: ممكن تبدأ مثلاً بـ "ازيك" أو "عامل ايه" لو مناسب، من غير جمل رسمية زي "أهلاً وسهلاً" أو "مع مين".
+- ردودك قصيرة وواضحة، من غير قوالب ثابتة طويلة.
+- لو بتحجز معاد، اسأل عن التفاصيل (نوع الخدمة، اليوم، الساعة) بطريقة طبيعية زي: "تحب نخلي الميعاد امتى؟ والساعة كام تقريباً؟" مع ذكر مثال واحد للتاريخ 2025-12-31 والوقت 09:30 عشان النظام يفهم.
+- لما التأكيد يتم، تقدر تقول جملة خفيفة زي "تمام، اعتبر الميعاد اتظبط، وتعلم في الخير" مع ملخص بسيط للميعاد من غير فورمات رسمية.
+- لو الطلب خارج التعليم أو الحجز (زي طلب أكل) وضّح بهدوء إن شغلك تعليم وحجز مواعيد بس.
+- بالنسبة للمكان، اعتبره معلومة اختيارية: اسأل عنه بطريقة لطيفة لو حاسس إنه مهم، ولو المستخدم ما ذكرش مكان مش لازم تعيد السؤال كتير.
+- لو فيه سياق إضافي: ${extraContext || 'لا يوجد'}.
+
+رسالة المستخدم: ${userText}
+`;
+
+  try {
+    const resp = await axios.post(
+      'https://api.openai.com/v1/chat/completions',
+      {
+        model: 'gpt-4.1-mini',
+        messages: [
+          { role: 'system', content: 'أنت بوت واتساب لطيف يساعد الطلاب في الحجز والمتابعة والرد على الاستفسارات التعليمية.' },
+          { role: 'user', content: prompt }
+        ],
+        temperature: 0.4,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 15000,
+      }
+    );
+
+    const answer = resp.data?.choices?.[0]?.message?.content?.trim() || '';
+    return answer || 'تمام، فهمت عليك. وضّح لي بس نقطة أو نقطتين أكتر علشان أظبط لك الرد.';
+  } catch (err) {
+    console.error('askChatAssistant error', err?.response?.data || err.message);
+    // Fallback to a safe generic reply if OpenAI fails
+    return 'تمام، وصلت رسالتك 👍\nحالياً في مشكلة بسيطة في المساعد الذكي، لكن فريق العمل هيتابع رسالتك ويرد عليك في أقرب وقت.';
+  }
 }
 
 // Helper: reminder text templates based on reminder_count (0 = first reminder)
@@ -531,7 +581,11 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
       if (session) {
         await db.run(`DELETE FROM whatsapp_sessions WHERE id = ?`, [session.id]);
       }
-      await sendWhatsApp(from, "تم إلغاء عملية الحجز الحالية.");
+      const cancelReply = await askChatAssistant(
+        text,
+        'المستخدم طلب إلغاء أي حجز أو إجراء جارٍ الآن. وضّح له بهدوء إن العملية اتلغت ولو احتاج يبدأ من جديد تقوله يكتب إنه عايز يحجز.'
+      );
+      await sendWhatsApp(from, cancelReply);
       return res.sendStatus(200);
     }
 
@@ -556,7 +610,23 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
         'session',
       ];
 
+      // Block obvious food/restaurant requests (outside scope of the center)
+      const foodKeywords = [
+        'أكل', 'اكل', 'وجبة', 'وجبات', 'مطعم', 'مطاعم', 'تيك اواي', 'تيك-اواي',
+        'burger', 'بيتزا', 'pizza', 'بورجر', 'شاورما', 'كباب', 'grill', 'مطع', 'اكل كويس'
+      ];
+
       const bookingIntent = bookingKeywords.some(w => low.includes(w));
+      const foodIntent = foodKeywords.some(w => low.includes(w));
+
+      if (foodIntent && !bookingIntent) {
+        const foodReply = await askChatAssistant(
+          text,
+          'الرسالة تبدو كطلب أكل أو مطعم. وضّح بهدوء إن دورك سكرتير لمركز تعليمي فقط، وتقدر تساعده في المواعيد أو الأسئلة التعليمية.'
+        );
+        await sendWhatsApp(from, foodReply);
+        return res.sendStatus(200);
+      }
 
       if (bookingIntent) {
         const nowIso = new Date().toISOString();
@@ -564,10 +634,11 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
           `INSERT INTO whatsapp_sessions (phone, step, created_at, updated_at) VALUES (?, ?, ?, ?)`,
           [from, 'ask_service', nowIso, nowIso]
         );
-        await sendWhatsApp(
-          from,
-          "أهلاً بك 👋\nتمام، هنظبط لك ميعاد مناسب. اكتب لي نوع الخدمة أو السبب اللي حابب تحجز علشانه (مثلاً: استشارة، درس، متابعة...)."
+        const startReply = await askChatAssistant(
+          text,
+          'ابدأ حوار حجز معاد بأسلوب بسيط كأنك سكرتير شخصي: سلم عليه بشكل عادي واسأله حابب يحجز على ايه أو محتاج ايه بالظبط (استشارة، درس، متابعة... إلخ) من غير جمل رسمية.'
         );
+        await sendWhatsApp(from, startReply);
         return res.sendStatus(200);
       }
     }
@@ -588,7 +659,11 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
           `UPDATE whatsapp_sessions SET service = ?, step = ?, updated_at = ? WHERE id = ?`,
           [service, step, nowIso, session.id]
         );
-        await sendWhatsApp(from, "تمام ✅\nاكتب اسم الشخص الذى سيتم الحجز له.");
+        const askPersonReply = await askChatAssistant(
+          text,
+          `تم تسجيل نوع الخدمة كالتالي: "${service}". اسأل المستخدم بأسلوب لطيف عن الاسم اللي هتسجل به الميعاد (اسمه أو اسم ابنه مثلاً)، من غير استخدام عبارات ثقيلة زي "مع مين".`
+        );
+        await sendWhatsApp(from, askPersonReply);
         return res.sendStatus(200);
       }
 
@@ -599,29 +674,69 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
           `UPDATE whatsapp_sessions SET person = ?, step = ?, updated_at = ? WHERE id = ?`,
           [person, step, nowIso, session.id]
         );
-        await sendWhatsApp(from, "اكتب تاريخ الموعد المطلوب بصيغة مثل: 2025-12-31");
+        const askDateReply = await askChatAssistant(
+          text,
+          'اسأل المستخدم بطريقة عادية عن اليوم/التاريخ اللي حابب يخلي فيه الميعاد، بس وضّح إنك محتاج تكتبه بصيغة YYYY-MM-DD واديله مثال واحد زي 2025-12-31 من غير ما تحسسه إنه بيتعامل مع نظام.'
+        );
+        await sendWhatsApp(from, askDateReply);
         return res.sendStatus(200);
       }
 
       if (step === 'ask_date') {
-        date = text.trim();
+        const rawDate = text.trim();
+        // Validate date format YYYY-MM-DD
+        const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+        const isFormatValid = dateRegex.test(rawDate);
+        const parsed = new Date(rawDate);
+        const isRealDate = !isNaN(parsed.getTime());
+
+        if (!isFormatValid || !isRealDate) {
+          const invalidDateReply = await askChatAssistant(
+            text,
+            'التاريخ اللي المستخدم كتبه مش مفهوم للنظام. اعتذر له بشكل بسيط، وقل له إنك محتاج التاريخ مكتوب بالصيغة دي YYYY-MM-DD مع مثال 2025-12-31، واطلب منه يعيد كتابته من غير رسمية أو توتر.'
+          );
+          await sendWhatsApp(from, invalidDateReply);
+          return res.sendStatus(200);
+        }
+
+        date = rawDate;
         step = 'ask_time';
         await db.run(
           `UPDATE whatsapp_sessions SET date = ?, step = ?, updated_at = ? WHERE id = ?`,
           [date, step, nowIso, session.id]
         );
-        await sendWhatsApp(from, "اكتب وقت الموعد بصيغة 24 ساعة مثل: 14:30");
+        const askTimeReply = await askChatAssistant(
+          text,
+          'اسأل المستخدم عن الوقت اللي يناسبه للميعاد بأسلوب عادي زي "تحب الساعة كام تقريباً؟"، واذكر إنك محتاج تكتبه بصيغة 24 ساعة HH:mm مع مثال 09:30 أو 14:45 عشان النظام يفهم.'
+        );
+        await sendWhatsApp(from, askTimeReply);
         return res.sendStatus(200);
       }
 
       if (step === 'ask_time') {
-        time = text.trim();
+        const rawTime = text.trim();
+        // Validate time format HH:mm (24h)
+        const timeRegex = /^([01]\d|2[0-3]):([0-5]\d)$/;
+        if (!timeRegex.test(rawTime)) {
+          const invalidTimeReply = await askChatAssistant(
+            text,
+            'الوقت اللي المستخدم كتبه مش واضح للنظام. اعتذر له ببساطة، وقل له إنك محتاج الوقت مكتوب بصيغة 24 ساعة HH:mm مع مثال 09:30 أو 14:45، واطلب منه يعيد كتابة الوقت بأسلوب هادي.'
+          );
+          await sendWhatsApp(from, invalidTimeReply);
+          return res.sendStatus(200);
+        }
+
+        time = rawTime;
         step = 'ask_location';
         await db.run(
           `UPDATE whatsapp_sessions SET time = ?, step = ?, updated_at = ? WHERE id = ?`,
           [time, step, nowIso, session.id]
         );
-        await sendWhatsApp(from, "لو في مكان معين للموعد اكتبه الآن، أو اكتب لا يوجد.");
+        const askLocationReply = await askChatAssistant(
+          text,
+          'اسأل المستخدم بشكل اختياري عن المكان لو حابب يحدد (مثلاً الفرع أو أونلاين)، ووضّح إن لو مش فارق معاه المكان يقدر يقول مفيش مشكلة، من غير جملة حرفية "اكتب لا يوجد".'
+        );
+        await sendWhatsApp(from, askLocationReply);
         return res.sendStatus(200);
       }
 
@@ -660,10 +775,12 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
 
         await db.run(`DELETE FROM whatsapp_sessions WHERE id = ?`, [session.id]);
 
-        await sendWhatsApp(
-          from,
-          `تم حجز الموعد بنجاح ✅\nالخدمة: ${session.service}\nالاسم: ${session.person}\nالتاريخ: ${session.date}\nالوقت: ${session.time}`
+        const confirmReply = await askChatAssistant(
+          text,
+          `تم الآن إنشاء حجز في النظام بهذه البيانات: الخدمة: ${session.service}, الاسم: ${session.person}, التاريخ: ${session.date}, الوقت: ${session.time}, المكان: ${location || 'غير محدد'}. ارسل للمستخدم رسالة تأكيد بأسلوب شخصي وخفيف، مثلاً إن الميعاد اتظبط وتقدر تقول جملة زي "تعلم في الخير" مع تلخيص بسيط للميعاد من غير فورمات رسمية طويلة.`
         );
+
+        await sendWhatsApp(from, confirmReply);
         return res.sendStatus(200);
       }
     }
@@ -692,45 +809,17 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
       }
       // hours are managed from dashboard only; do not parse numbers from messages
     } else {
-      const st = await db.run(`INSERT INTO students (name, phone) VALUES (?, ?)`, ["whatsapp_user", from]);
+      // إذا لم يوجد طالب مرتبط بهذا الرقم ننشئ طالبًا جديدًا باسم رقم الهاتف
+      const st = await db.run(`INSERT INTO students (name, phone) VALUES (?, ?)`, [from, from]);
       await db.run(`INSERT INTO tasks (student_id, task, status, note) VALUES (?, ?, ?, ?)`, [st.lastID, "message from user", newStatus || "pending", note]);
     }
 
-    // Simple rule-based auto-replies for general conversation (more natural tone + wider vocabulary)
-    let reply = null;
-    const lowAr = text.trim();
+    // اعتمد على ChatGPT ليكون هو السكرتير الشخصي في أغلب الردود
+    const extraContext = newStatus
+      ? `حالة آخر مهمة لهذا الرقم الآن هي: ${newStatus === 'done' ? 'منتهية' : 'لم تكتمل'}.`
+      : '';
 
-    // Intent flags
-    const hasThanks = /\b(شكرا|شُكْرًا|شكرًا|thx|thanx|thanks|thank you)\b/i.test(lowAr);
-    const hasHello = /(السلام عليكم|عليكم السلام|ازيك|ازاىك|اهلا|أهلا|يا دكتور|يا دكتور|مرحبا|هلا|hello|hi|hey)/i.test(lowAr);
-    const hasAppt = /(ميعاد|موعد|حجز|معاد|دكتور|طبيب|مدرس|استاذ|أستاذ|جلسة|سيشن|lecture|lesson|class|session|meeting)/i.test(lowAr);
-    const hasPrice = /(سعر|ثمن|price|تكلفة|كام|كم سعر|بكام|بقد ايه)/i.test(lowAr);
-    const hasApology = /(اسف|آسف|متأسف|عذرًا|عذرا|sorry|my bad)/i.test(lowAr);
-    const hasUrgent = /(ضروري|مهم|مستعجل|عاجل|important|urgent)/i.test(lowAr);
-    const hasConfused = /(مش فاهم|مش واضح|مش مفهوم|مش عارف|help|ساعدني|محتاج مساعدة|عايز افهم)/i.test(lowAr);
-
-    if (hasThanks && !hasAppt && !hasPrice) {
-      reply = "العفو 🤍 يسعدنا وجودك دايمًا. لو احتجت أي مساعدة أو حابب تحجز ميعاد، كلمني في أي وقت.";
-    } else if (hasApology) {
-      reply = "ولا يهمك خالص 😊\nإحنا موجودين عشان نساعدك، احكيلي بهدوء محتاج إيه أو حابب نرجع من الأول.";
-    } else if (hasHello && !hasAppt && !hasPrice) {
-      reply = "أهلاً وسهلاً 👋\nأنا معاك هنا، تحب تسأل عن إيه أو تحجز معاد مع مين؟";
-    } else if (hasAppt) {
-      reply = "تمام، فهمت إنك حابب تحجز معاد أو جلسة 😊\nاكتب لي اليوم والتوقيت اللي يناسبك، أو نوع الجلسة (مثلاً: استشارة، درس، متابعة)، وهنتابع معاك.";
-    } else if (hasPrice) {
-      reply = "بالنسبة للأسعار فهي بتختلف حسب نوع الخدمة والجلسة وعدد المرات 👌\nهنراجع طلبك ونتواصل معاك بأقرب وقت بكل التفاصيل والسعر الأنسب ليك.";
-    } else if (hasUrgent) {
-      reply = "شايف إن الموضوع مهم بالنسبة لك 👍\nهنتابع رسالتك بأولوية، ولو تحب وضّحلي بسرعة أنت محتاج إيه بالظبط عشان نساعدك أسرع.";
-    } else if (hasConfused) {
-      reply = "تمام، خلينا نبسّط الدنيا شوية 😊\nاكتب لي بس: حابب تحجز معاد؟ ولا عندك سؤال عن خدمة أو عن مهمة متابعة معينة؟";
-    } else if (newStatus === "done") {
-      reply = "جميل جدًا 👏\nسجلت عندي إنك خلّصت المهمة، واستمر على نفس المستوى الممتاز. لو في مهمة جديدة حابب تضيفها قول لي.";
-    } else if (newStatus === "failed") {
-      reply = "شكرًا إنك وضحت الموقف 🙏\nمفيش مشكلة خالص، نقدر نعدّل الخطة أو نغيّر أسلوب المتابعة عشان يناسبك أكتر.";
-    } else {
-      // Default friendly fallback when no specific intent is detected
-      reply = "تمام، وصلت رسالتك 👍\nاحكيلي شوية أكتر: حابب تحجز ميعاد، تسأل عن الأسعار، ولا عندك استفسار عن مهمة أو خدمة معينة؟";
-    }
+    const reply = await askChatAssistant(text, extraContext);
 
     await sendWhatsApp(from, reply);
     res.sendStatus(200);
