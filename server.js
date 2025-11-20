@@ -998,12 +998,14 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
 
         await db.run(`DELETE FROM whatsapp_sessions WHERE id = ?`, [session.id]);
 
-        const confirmReply = await askChatAssistant(
-          text,
-          `تم الآن إنشاء حجز في النظام بهذه البيانات: الخدمة: ${session.service}, الاسم: ${session.person}, التاريخ: ${session.date}, الوقت: ${session.time}, المكان: ${location || 'غير محدد'}. ارسل للمستخدم رسالة تأكيد بأسلوب شخصي وخفيف، مثلاً إن الميعاد اتظبط وتقدر تقول جملة زي "تعلم في الخير" مع تلخيص بسيط للميعاد من غير فورمات رسمية طويلة.`
-        );
+        const confirmation = `اتسجل المعاد:
+الخدمة: ${session.service || '-'}
+الاسم: ${session.person || '-'}
+اليوم: ${session.date}
+الساعة: ${session.time}
+تعلِّم في الخير.`;
 
-        await sendWhatsApp(from, confirmReply);
+        await sendWhatsApp(from, confirmation);
         return res.sendStatus(200);
       }
     }
