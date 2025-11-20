@@ -670,7 +670,6 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
 
     let newStatus = null;
     let note = null;
-    const low = text.trim().toLowerCase();
     if (["نعم","yes","تمام","خلصت","تم"].some(w => low.includes(w))) {
       newStatus = "done";
     } else if (["لا","not","no","مش","لأ"].some(w => low.includes(w))) {
