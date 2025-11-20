@@ -283,6 +283,148 @@ function normalizePhone(input) {
   return p;
 }
 
+// --- Helpers to normalize human-friendly date/time into strict formats ---
+
+// Normalize various date inputs (e.g. 31-12-2025, 31/12, بكرة, بعد بكره, السبت الجاي) to YYYY-MM-DD
+function normalizeUserDate(raw) {
+  if (!raw) return { ok: false };
+  const text = String(raw).trim().toLowerCase();
+
+  const today = new Date();
+  const pad = (n) => (n < 10 ? '0' + n : '' + n);
+
+  // relative words
+  if (/(بكرة|غدا|غداً)/.test(text)) {
+    const d = new Date(today);
+    d.setDate(d.getDate() + 1);
+    return { ok: true, value: `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}` };
+  }
+  if (/بعد ?بكر(ة|ه)?/.test(text)) {
+    const d = new Date(today);
+    d.setDate(d.getDate() + 2);
+    return { ok: true, value: `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}` };
+  }
+
+  // weekdays: السبت الجاي، الاحد القادم ...
+  const weekdayMap = {
+    'السبت': 6,
+    'الاحد': 0, 'الأحد': 0,
+    'الاثنين': 1, 'الإثنين': 1,
+    'الثلاثاء': 2,
+    'الاربعاء': 3, 'الأربعاء': 3,
+    'الخميس': 4,
+    'الجمعة': 5
+  };
+  const weekdayMatch = text.match(/(السبت|الاحد|الأحد|الاثنين|الإثنين|الثلاثاء|الاربعاء|الأربعاء|الخميس|الجمعة)(\s+الجاى|\s+الجاي|\s+القادم)?/);
+  if (weekdayMatch) {
+    const targetDow = weekdayMap[weekdayMatch[1]];
+    if (typeof targetDow === 'number') {
+      const d = new Date(today);
+      const currentDow = d.getDay();
+      let diff = targetDow - currentDow;
+      if (diff <= 0) diff += 7; // next occurrence
+      d.setDate(d.getDate() + diff);
+      return { ok: true, value: `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}` };
+    }
+  }
+
+  // numeric formats
+  // YYYY-MM-DD or YYYY/MM/DD
+  let m = text.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})$/);
+  if (m) {
+    const y = parseInt(m[1], 10);
+    const mo = parseInt(m[2], 10) - 1;
+    const da = parseInt(m[3], 10);
+    const d = new Date(y, mo, da);
+    if (!isNaN(d.getTime())) {
+      return { ok: true, value: `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}` };
+    }
+  }
+
+  // DD-MM-YYYY or DD/MM/YYYY
+  m = text.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})$/);
+  if (m) {
+    const y = parseInt(m[3], 10);
+    const mo = parseInt(m[2], 10) - 1;
+    const da = parseInt(m[1], 10);
+    const d = new Date(y, mo, da);
+    if (!isNaN(d.getTime())) {
+      return { ok: true, value: `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}` };
+    }
+  }
+
+  // DD-MM or DD/MM -> assume current year
+  m = text.match(/^(\d{1,2})[-\/](\d{1,2})$/);
+  if (m) {
+    const y = today.getFullYear();
+    const mo = parseInt(m[2], 10) - 1;
+    const da = parseInt(m[1], 10);
+    const d = new Date(y, mo, da);
+    if (!isNaN(d.getTime())) {
+      return { ok: true, value: `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}` };
+    }
+  }
+
+  return { ok: false };
+}
+
+// Normalize time expressions into HH:mm 24h (e.g. 9:30, 9 ونص, 11 الصبح, 7 بالليل)
+function normalizeUserTime(raw) {
+  if (!raw) return { ok: false };
+  const text = String(raw).trim().toLowerCase();
+  const pad = (n) => (n < 10 ? '0' + n : '' + n);
+
+  // detect am/pm words
+  let isMorning = /(صباح|الصبح|am)/.test(text);
+  let isEvening = /(مساء|المساء|ليل|بالليل|pm)/.test(text);
+
+  // 9:30, 09:30 etc
+  let m = text.match(/^(\d{1,2})[:٫\.,](\d{1,2})/);
+  if (m) {
+    let h = parseInt(m[1], 10);
+    let min = parseInt(m[2], 10);
+    if (isNaN(min)) min = 0;
+    if (h <= 12 && isEvening) {
+      if (h < 12) h += 12;
+    } else if (h === 12 && isMorning) {
+      h = 0;
+    }
+    if (h >= 0 && h <= 23 && min >= 0 && min <= 59) {
+      return { ok: true, value: `${pad(h)}:${pad(min)}` };
+    }
+  }
+
+  // "9 ونص" / "9 و نص" / "9 ونصف"
+  m = text.match(/^(\d{1,2})\s*(و)?\s*(نص|نصف)/);
+  if (m) {
+    let h = parseInt(m[1], 10);
+    if (h <= 12 && isEvening) {
+      if (h < 12) h += 12;
+    } else if (h === 12 && isMorning) {
+      h = 0;
+    }
+    if (h >= 0 && h <= 23) {
+      return { ok: true, value: `${pad(h)}:30` };
+    }
+  }
+
+  // "11 الصبح" / "7 بالليل" / just hour
+  m = text.match(/^(\d{1,2})/);
+  if (m) {
+    let h = parseInt(m[1], 10);
+    if (h <= 12 && isEvening) {
+      if (h < 12) h += 12;
+    } else if (h === 12 && isMorning) {
+      h = 0;
+    }
+    if (h >= 0 && h <= 23) {
+      return { ok: true, value: `${pad(h)}:00` };
+    }
+  }
+
+  return { ok: false };
+}
+
 // WhatsApp helper
 async function sendWhatsApp(to, text) {
   if (!WHATSAPP_TOKEN || !WHATSAPP_PHONE_ID) throw new Error("WhatsApp config missing");
@@ -577,6 +719,12 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
       [from]
     );
 
+    // Direct Islamic greeting reply
+    if (/(^|\s)(السلام عليكم|سلام عليكم)(\s|$)/.test(text)) {
+      await sendWhatsApp(from, "وعليكم السلام ورحمة الله وبركاته");
+      return res.sendStatus(200);
+    }
+
     if (low.includes('الغاء') || low.includes('إلغاء') || low.includes('cancel')) {
       if (session) {
         await db.run(`DELETE FROM whatsapp_sessions WHERE id = ?`, [session.id]);
@@ -684,13 +832,9 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
 
       if (step === 'ask_date') {
         const rawDate = text.trim();
-        // Validate date format YYYY-MM-DD
-        const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
-        const isFormatValid = dateRegex.test(rawDate);
-        const parsed = new Date(rawDate);
-        const isRealDate = !isNaN(parsed.getTime());
+        const normalized = normalizeUserDate(rawDate);
 
-        if (!isFormatValid || !isRealDate) {
+        if (!normalized.ok) {
           const invalidDateReply = await askChatAssistant(
             text,
             'التاريخ اللي المستخدم كتبه مش مفهوم للنظام. اعتذر له بشكل بسيط، وقل له إنك محتاج التاريخ مكتوب بالصيغة دي YYYY-MM-DD مع مثال 2025-12-31، واطلب منه يعيد كتابته من غير رسمية أو توتر.'
@@ -699,7 +843,7 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
           return res.sendStatus(200);
         }
 
-        date = rawDate;
+        date = normalized.value;
         step = 'ask_time';
         await db.run(
           `UPDATE whatsapp_sessions SET date = ?, step = ?, updated_at = ? WHERE id = ?`,
@@ -715,9 +859,8 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
 
       if (step === 'ask_time') {
         const rawTime = text.trim();
-        // Validate time format HH:mm (24h)
-        const timeRegex = /^([01]\d|2[0-3]):([0-5]\d)$/;
-        if (!timeRegex.test(rawTime)) {
+        const normalizedTime = normalizeUserTime(rawTime);
+        if (!normalizedTime.ok) {
           const invalidTimeReply = await askChatAssistant(
             text,
             'الوقت اللي المستخدم كتبه مش واضح للنظام. اعتذر له ببساطة، وقل له إنك محتاج الوقت مكتوب بصيغة 24 ساعة HH:mm مع مثال 09:30 أو 14:45، واطلب منه يعيد كتابة الوقت بأسلوب هادي.'
@@ -726,7 +869,7 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
           return res.sendStatus(200);
         }
 
-        time = rawTime;
+        time = normalizedTime.value;
         step = 'ask_location';
         await db.run(
           `UPDATE whatsapp_sessions SET time = ?, step = ?, updated_at = ? WHERE id = ?`,
