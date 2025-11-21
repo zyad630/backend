@@ -157,6 +157,9 @@ const WHATSAPP_TEMPLATE_NAME = process.env.WHATSAPP_TEMPLATE_NAME || null;
 const WHATSAPP_TEMPLATE_LANG = process.env.WHATSAPP_TEMPLATE_LANG || 'en_US';
 const APP_SECRET = process.env.APP_SECRET || null;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'amjd';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'za123';
+const AUTH_SECRET = process.env.AUTH_SECRET || API_KEY;
 
 if (!API_KEY) {
   console.error('FATAL: API_KEY is not defined in environment variables');
@@ -235,6 +238,12 @@ let db;
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS blocked_phones (
+      phone TEXT PRIMARY KEY,
+      reason TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
   `);
 
   // Migrate existing table to include missing columns
@@ -264,12 +273,106 @@ let db;
 
   console.log("✅ Database ready.");
 
+  // Simple helpers for auth token (HMAC-signed, 1 hour expiry)
+  function createAuthToken(username) {
+    const exp = Date.now() + 60 * 60 * 1000; // 1 hour
+    const payload = { sub: username, exp };
+    const data = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    const sig = crypto.createHmac('sha256', AUTH_SECRET).update(data).digest('base64url');
+    return `${data}.${sig}`;
+  }
+
+  function verifyAuthToken(token) {
+    if (!token || typeof token !== 'string') return null;
+    const parts = token.split('.');
+    if (parts.length !== 2) return null;
+    const [data, sig] = parts;
+    const expected = crypto.createHmac('sha256', AUTH_SECRET).update(data).digest('base64url');
+    if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
+    let payload;
+    try {
+      payload = JSON.parse(Buffer.from(data, 'base64url').toString('utf8'));
+    } catch {
+      return null;
+    }
+    if (!payload || typeof payload.exp !== 'number' || Date.now() > payload.exp) return null;
+    return payload;
+  }
+
   // تشغيل السيرفر
   app.listen(PORT, () => {
     console.log(`✅ Backend running on port ${PORT}`);
     console.log(`🔐 API_KEY (use in n8n x-api-key): ${API_KEY}`);
   });
 })();
+
+// ===== Auth endpoints for admin login (simple, token-based) =====
+
+app.post('/auth/login', async (req, res) => {
+  try {
+    const { username, password } = req.body || {};
+    if (username !== ADMIN_USERNAME || password !== ADMIN_PASSWORD) {
+      return res.status(401).json({ success: false, error: 'بيانات الدخول غير صحيحة' });
+    }
+
+    const token = (function createToken() {
+      const exp = Date.now() + 60 * 60 * 1000; // 1 hour
+      const payload = { sub: ADMIN_USERNAME, exp };
+      const data = Buffer.from(JSON.stringify(payload)).toString('base64url');
+      const sig = crypto.createHmac('sha256', AUTH_SECRET).update(data).digest('base64url');
+      return `${data}.${sig}`;
+    })();
+
+    return res.json({
+      success: true,
+      token,
+      user: { username: ADMIN_USERNAME }
+    });
+  } catch (e) {
+    console.error('auth login error', e);
+    return res.status(500).json({ success: false, error: 'خطأ في تسجيل الدخول' });
+  }
+});
+
+app.post('/auth/logout', (req, res) => {
+  // Token is stored client-side only; just respond OK
+  return res.json({ success: true });
+});
+
+app.get('/auth/me', (req, res) => {
+  try {
+    const auth = req.headers.authorization || '';
+    const parts = auth.split(' ');
+    if (parts.length !== 2 || parts[0] !== 'Bearer') {
+      return res.status(401).json({ success: false, error: 'غير مصرح' });
+    }
+    const token = parts[1];
+    const payload = (function verify(tokenStr) {
+      if (!tokenStr || typeof tokenStr !== 'string') return null;
+      const [data, sig] = tokenStr.split('.');
+      if (!data || !sig) return null;
+      const expected = crypto.createHmac('sha256', AUTH_SECRET).update(data).digest('base64url');
+      if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
+      let pl;
+      try {
+        pl = JSON.parse(Buffer.from(data, 'base64url').toString('utf8'));
+      } catch {
+        return null;
+      }
+      if (!pl || typeof pl.exp !== 'number' || Date.now() > pl.exp) return null;
+      return pl;
+    })(token);
+
+    if (!payload) {
+      return res.status(401).json({ success: false, error: 'غير مصرح' });
+    }
+
+    return res.json({ success: true, user: { username: ADMIN_USERNAME } });
+  } catch (e) {
+    console.error('auth me error', e);
+    return res.status(500).json({ success: false, error: 'خطأ في التحقق' });
+  }
+});
 
 // Helper to check API key already exists: checkApiKey
 
@@ -285,7 +388,7 @@ function normalizePhone(input) {
 
 // --- Helpers to normalize human-friendly date/time into strict formats ---
 
-// Normalize various date inputs (e.g. 31-12-2025, 31/12, بكرة, بعد بكره, السبت الجاي) to YYYY-MM-DD
+// Normalize various date inputs (e.g. 31-12-2025, 31/12, 31 12 2025, 31 12, بكرة/بكره, بعد بكره, الشهر الجاي يوم 9, السبت الجاي) to YYYY-MM-DD
 function normalizeUserDate(raw) {
   if (!raw) return { ok: false };
   const text = String(raw).trim().toLowerCase();
@@ -294,7 +397,7 @@ function normalizeUserDate(raw) {
   const pad = (n) => (n < 10 ? '0' + n : '' + n);
 
   // relative words
-  if (/(بكرة|غدا|غداً)/.test(text)) {
+  if (/(بكرة|بكره|غدا|غداً)/.test(text)) {
     const d = new Date(today);
     d.setDate(d.getDate() + 1);
     return { ok: true, value: `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}` };
@@ -303,6 +406,20 @@ function normalizeUserDate(raw) {
     const d = new Date(today);
     d.setDate(d.getDate() + 2);
     return { ok: true, value: `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}` };
+  }
+
+  // الشهر الجاي مع يوم محدد: "الشهر الجاي يوم 9"
+  const nextMonthDayMatch = text.match(/الشهر\s+(الجاي|القادم)[^\d]*(\d{1,2})/);
+  if (nextMonthDayMatch) {
+    const day = parseInt(nextMonthDayMatch[2], 10);
+    if (day >= 1 && day <= 31) {
+      const d = new Date(today);
+      d.setMonth(d.getMonth() + 1);
+      d.setDate(day);
+      if (!isNaN(d.getTime())) {
+        return { ok: true, value: `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}` };
+      }
+    }
   }
 
   // weekdays: السبت الجاي، الاحد القادم ...
@@ -329,8 +446,8 @@ function normalizeUserDate(raw) {
   }
 
   // numeric formats
-  // YYYY-MM-DD or YYYY/MM/DD
-  let m = text.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})$/);
+  // YYYY-MM-DD or YYYY/MM/DD or "YYYY MM DD"
+  let m = text.match(/^(\d{4})[-\/\s](\d{1,2})[-\/\s](\d{1,2})$/);
   if (m) {
     const y = parseInt(m[1], 10);
     const mo = parseInt(m[2], 10) - 1;
@@ -341,8 +458,8 @@ function normalizeUserDate(raw) {
     }
   }
 
-  // DD-MM-YYYY or DD/MM/YYYY
-  m = text.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})$/);
+  // DD-MM-YYYY or DD/MM/YYYY or "DD MM YYYY"
+  m = text.match(/^(\d{1,2})[-\/\s](\d{1,2})[-\/\s](\d{4})$/);
   if (m) {
     const y = parseInt(m[3], 10);
     const mo = parseInt(m[2], 10) - 1;
@@ -353,8 +470,8 @@ function normalizeUserDate(raw) {
     }
   }
 
-  // DD-MM or DD/MM -> assume current year
-  m = text.match(/^(\d{1,2})[-\/](\d{1,2})$/);
+  // DD-MM or DD/MM or "DD MM" -> assume current year
+  m = text.match(/^(\d{1,2})[-\/\s](\d{1,2})$/);
   if (m) {
     const y = today.getFullYear();
     const mo = parseInt(m[2], 10) - 1;
@@ -796,6 +913,13 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
     try { await db.run(`INSERT INTO messages (direction, phone, type, body) VALUES ('in', ?, 'text', ?)`, [from, text]); } catch (e) {}
     const low = text.trim().toLowerCase();
 
+    // Check if phone is blocked for abusive language
+    const blocked = await db.get(`SELECT phone FROM blocked_phones WHERE phone = ?`, [from]);
+    if (blocked) {
+      // Ignore any further messages from this number
+      return res.sendStatus(200);
+    }
+
     const session = await db.get(
       `SELECT * FROM whatsapp_sessions WHERE phone = ? ORDER BY id DESC LIMIT 1`,
       [from]
@@ -803,7 +927,30 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
 
     // Direct Islamic greeting reply
     if (/(^|\s)(السلام عليكم|سلام عليكم)(\s|$)/.test(text)) {
-      await sendWhatsApp(from, "وعليكم السلام ورحمة الله وبركاته");
+      await sendWhatsApp(from, "وعليكم السلام ورحمة الله وبركاته\nإزاي أقدر أساعدك؟");
+      return res.sendStatus(200);
+    }
+
+    // Detect abusive / bad language (basic list) and block user
+    const badWords = [
+      'زب', 'طيز', 'خرا', 'قحبة', 'شرموط', 'متنايل', 'يلعن', 'كس ام', 'كسم', 'fuck', 'shit'
+    ];
+    if (badWords.some(w => low.includes(w))) {
+      try {
+        await db.run(
+          `INSERT OR IGNORE INTO blocked_phones (phone, reason) VALUES (?, ?)` ,
+          [from, 'abusive_language']
+        );
+      } catch (e) {}
+      await sendWhatsApp(from, "هبلغ المسؤول عن الأسلوب ده، ومش هقدر أكمل معاك الرد.");
+      return res.sendStatus(200);
+    }
+
+    // If message is purely English/Latin letters (no Arabic), ask to use Arabic
+    const hasArabic = /[\u0600-\u06FF]/.test(text);
+    const hasLatin = /[A-Za-z]/.test(text);
+    if (!hasArabic && hasLatin && !session) {
+      await sendWhatsApp(from, "لو تقدر تكتب بالعربي يكون أسهل عليا أظبطلك المواعيد.");
       return res.sendStatus(200);
     }
 
@@ -852,11 +999,34 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
 
       if (bookingIntent) {
         const nowIso = new Date().toISOString();
+
+        // حاول نفهم من نفس الرسالة اليوم والساعة لو اتكتبوا في الجملة
+        const dateGuess = normalizeUserDate(text);
+        const timeGuess = normalizeUserTime(text);
+
+        // تخمين بسيط لنوع الخدمة من الكلمات
+        let serviceGuess = 'موعد';
+        if (low.includes('ميتنج') || low.includes('meeting')) serviceGuess = 'ميتنج';
+        else if (low.includes('استشارة') || low.includes('consult')) serviceGuess = 'استشارة';
+        else if (low.includes('جلسة') || low.includes('سيشن') || low.includes('session')) serviceGuess = 'جلسة';
+
+        if (dateGuess.ok && timeGuess.ok) {
+          // كل البيانات موجودة ما عدا الاسم → نبدأ من سؤال الاسم مباشرة
+          await db.run(
+            `INSERT INTO whatsapp_sessions (phone, step, service, date, time, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [from, 'ask_person', serviceGuess, dateGuess.value, timeGuess.value, nowIso, nowIso]
+          );
+          await sendWhatsApp(from, "تمام، الاسم اللي نحجز بيه إيه؟");
+          return res.sendStatus(200);
+        }
+
+        // لو المعلومات مش كاملة نرجع للفلو العادي خطوة خطوة
         await db.run(
           `INSERT INTO whatsapp_sessions (phone, step, created_at, updated_at) VALUES (?, ?, ?, ?)`,
           [from, 'ask_service', nowIso, nowIso]
         );
-        await sendWhatsApp(from, "تمام، نوع المعاد إيه؟");
+        await sendWhatsApp(from, "تمام، تحب تستفسر عن إيه أو تحجز على إيه؟");
         return res.sendStatus(200);
       }
     }
@@ -894,10 +1064,16 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
 
       if (step === 'ask_date') {
         const rawDate = text.trim();
+        // حالة خاصة: الشهر الجاي فقط بدون يوم
+        if (/الشهر\s+الجاي|الشهر\s+القادم/.test(rawDate)) {
+          await sendWhatsApp(from, "الشهر الجاي كبير، محتاج اليوم كمان (مثلاً 10 أو 15).");
+          return res.sendStatus(200);
+        }
+
         const normalized = normalizeUserDate(rawDate);
 
         if (!normalized.ok) {
-          await sendWhatsApp(from, "مش واضح… توضحلي اليوم أو الشهر؟");
+          await sendWhatsApp(from, "أنا محتاج التاريخ يكون أوضح شوية (اليوم والشهر على الأقل).");
           return res.sendStatus(200);
         }
 
@@ -925,7 +1101,7 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
           `UPDATE whatsapp_sessions SET time = ?, step = ?, updated_at = ? WHERE id = ?`,
           [time, step, nowIso, session.id]
         );
-        await sendWhatsApp(from, "حابب تحدد مكان معين للمعاد ولا مش فارق؟");
+        await sendWhatsApp(from, "لو حابب تحدد مكان أو فرع معين للمعاد اكتبلي، ولو مش فارق معاك المكان قول مفيش مكان محدد.");
         return res.sendStatus(200);
       }
 
@@ -964,16 +1140,31 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
 
         await db.run(`DELETE FROM whatsapp_sessions WHERE id = ?`, [session.id]);
 
+        // توضيح بسيط للصباح/المساء في رسالة التأكيد
+        let periodLabel = '';
+        try {
+          const hour = parseInt(String(session.time || '00:00').split(':')[0], 10);
+          if (!isNaN(hour)) {
+            periodLabel = hour < 12 ? ' صباحًا' : ' مساءً';
+          }
+        } catch {}
+
         const confirmation = `اتسجل المعاد:
 الخدمة: ${session.service || '-'}
 الاسم: ${session.person || '-'}
 اليوم: ${session.date}
-الساعة: ${session.time}
-تعلِّم في الخير.`;
+الساعة: ${session.time}${periodLabel}`;
 
         await sendWhatsApp(from, confirmation);
         return res.sendStatus(200);
       }
+    }
+
+    // إذا لم يكن هناك حجز جارٍ ولا نية حجز واضحة
+    // نرفض أي مواضيع خارج الحجز/المواعيد بأسلوب مهني
+    if (!session) {
+      await sendWhatsApp(from, "أنا هنا علشان أظبط المواعيد والحجوزات بس. لو محتاج تحجز أو تعدّل معاد اكتبلي التفاصيل، وأساعدك فيها.");
+      return res.sendStatus(200);
     }
 
     let newStatus = null;
