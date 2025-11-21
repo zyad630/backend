@@ -235,6 +235,7 @@ let db;
       time TEXT,
       location TEXT,
       notes TEXT,
+      pending_hour TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT
     );
@@ -246,7 +247,7 @@ let db;
     );
   `);
 
-  // Migrate existing table to include missing columns
+  // Migrate existing tables to include missing columns
   const existingCols = await db.all(`PRAGMA table_info(meetings)`);
   const colNames = new Set(existingCols.map(c => c.name));
   const addCol = async (name, type, defaultExpr = null) => {
@@ -269,6 +270,13 @@ let db;
   const taskColNames = new Set(taskCols.map(c => c.name));
   if (!taskColNames.has('reminder_count')) {
     await db.exec(`ALTER TABLE tasks ADD COLUMN reminder_count INTEGER DEFAULT 0`);
+  }
+
+  // ensure whatsapp_sessions has pending_hour column
+  const wsCols = await db.all(`PRAGMA table_info(whatsapp_sessions)`);
+  const wsColNames = new Set(wsCols.map(c => c.name));
+  if (!wsColNames.has('pending_hour')) {
+    await db.exec(`ALTER TABLE whatsapp_sessions ADD COLUMN pending_hour TEXT`);
   }
 
   console.log("✅ Database ready.");
@@ -694,6 +702,61 @@ async function askChatAssistant(userText, extraContext = '') {
   }
 }
 
+async function classifyIntentWithLLM(text) {
+  if (!OPENAI_API_KEY) {
+    return { intent: 'rule_based' };
+  }
+
+  const systemPrompt = 'أنت مصنّف نوايا رسائل على واتساب لمركز تعليمي. مطلوب منك فقط تحديد نوع الرسالة بشكل بسيط، بدون رد على العميل.';
+  const userPrompt = `
+الرسالة من العميل:
+"${String(text || '').trim()}"
+
+صنِّف النية الرئيسية للرسالة إلى واحدة فقط من القيم التالية:
+- booking: لو واضح إنه عايز يحجز أو يعدّل/يلغي معاد.
+- smalltalk: لو دردشة عامة أو هزار مش له علاقة مباشرة بالحجز (مثلاً "هو الدكتور نايم ولا إيه"، "إيه الأخبار"...).
+- complaint: لو شكوى أو تضايق من خدمة أو تأخير.
+- other: أي شيء غير ذلك.
+
+أرجع فقط JSON بالشكل التالي:
+{
+  "intent": "booking" | "smalltalk" | "complaint" | "other"
+}`;
+
+  try {
+    const resp = await axios.post(
+      'https://api.openai.com/v1/chat/completions',
+      {
+        model: 'gpt-4.1-mini',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt }
+        ],
+        temperature: 0,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 8000,
+      }
+    );
+
+    const content = resp.data?.choices?.[0]?.message?.content?.trim();
+    try {
+      const parsed = JSON.parse(content);
+      const intent = parsed.intent || 'other';
+      return { intent };
+    } catch {
+      return { intent: 'other' };
+    }
+  } catch (err) {
+    console.error('classifyIntentWithLLM error', err?.response?.data || err.message);
+    return { intent: 'other' };
+  }
+}
+
 // Helper: ask LLM for a short clarification question for a specific step
 async function askStepClarifier(step, userText) {
   if (!OPENAI_API_KEY) {
@@ -745,6 +808,83 @@ async function askStepClarifier(step, userText) {
   if (step === 'date') return 'محتاج اليوم يكون واضح (مثلاً 15/10 أو السبت الجاي).';
   if (step === 'time') return 'محتاج الساعة تكون واضحة (مثلاً 5 الصبح أو 7 بالليل).';
   return 'محتاج توضيح بسيط علشان أكمّل معاك.';
+}
+
+async function validatePersonNameWithLLM(rawName) {
+  if (!OPENAI_API_KEY) {
+    const trimmed = String(rawName || '').trim();
+    if (trimmed.length < 2) {
+      return {
+        ok: false,
+        cleanedName: null,
+        message: 'محتاج اسم الشخص اللي نحجزله يكون أوضح شوية (مثلاً اسم واحد أو اسمين بالعربي).'
+      };
+    }
+    return { ok: true, cleanedName: trimmed, message: null };
+  }
+
+  const systemPrompt = 'أنت مساعد يتحقق من أن النص اسم شخص حقيقي ومناسب للحجز. تعمل بالعربي المصري. لا تسمح بالأسماء التهريجية أو الشتائم أو الجمل الكاملة. لا تشرح كثيرًا، فقط قرر هل يصلح كاسم أم لا.';
+  const userPrompt = `
+النص: "${String(rawName || '').trim()}"
+
+قرر:
+- هل يمكن اعتباره اسم شخص طبيعي (مثلاً: أحمد، محمد علي، سارة محمد)؟
+- لو لا، اكتب رسالة قصيرة تطلب من العميل يكتب اسم واضح ومهذب.
+
+أرجع فقط JSON بهذا الشكل:
+{
+  "ok": true أو false,
+  "cleanedName": "الاسم بعد التنضيف أو null",
+  "message": "رسالة قصيرة للعميل لو ok = false أو null لو ok = true"
+}`;
+
+  try {
+    const resp = await axios.post(
+      'https://api.openai.com/v1/chat/completions',
+      {
+        model: 'gpt-4.1-mini',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt }
+        ],
+        temperature: 0,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 15000,
+      }
+    );
+
+    const content = resp.data?.choices?.[0]?.message?.content?.trim();
+    try {
+      const parsed = JSON.parse(content);
+      return {
+        ok: !!parsed.ok,
+        cleanedName: parsed.cleanedName || null,
+        message: parsed.message || null,
+      };
+    } catch {
+      return {
+        ok: false,
+        cleanedName: null,
+        message: 'محتاج اسم واضح للشخص اللي نحجزله (مثلاً أحمد محمد).',
+      };
+    }
+  } catch (err) {
+    console.error('validatePersonNameWithLLM error', err?.response?.data || err.message);
+    const trimmed = String(rawName || '').trim();
+    if (trimmed.length < 2) {
+      return {
+        ok: false,
+        cleanedName: null,
+        message: 'محتاج اسم واضح للشخص اللي نحجزله (مثلاً أحمد محمد).',
+      };
+    }
+    return { ok: true, cleanedName: trimmed, message: null };
+  }
 }
 
 // Helper: reminder text templates based on reminder_count (0 = first reminder)
@@ -976,41 +1116,22 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
     }
 
     if (!session) {
-      // Detect booking intent with broader phrases (doctor/teacher/session/etc.)
-      const bookingKeywords = [
-        'حجز',
-        'ميتنج',
-        'meeting',
-        'موعد',
-        'ميعاد',
-        'استشارة',
-        'consult',
-        'دكتور',
-        'طبيب',
-        'مدرس',
-        'استاذ',
-        'محاضرة',
-        'جلسة',
-        'سيشن',
-        'lecture',
-        'session',
-      ];
+      // استخدم LLM لتصنيف نية الرسالة أولاً
+      const { intent } = await classifyIntentWithLLM(text);
 
-      // Block obvious food/restaurant requests (outside scope of the center)
+      // Block obvious food/restaurant requests (outside scope of the center) بناءً على قواعد سريعة
       const foodKeywords = [
         'أكل', 'اكل', 'وجبة', 'وجبات', 'مطعم', 'مطاعم', 'تيك اواي', 'تيك-اواي',
         'burger', 'بيتزا', 'pizza', 'بورجر', 'شاورما', 'كباب', 'grill', 'مطع', 'اكل كويس'
       ];
-
-      const bookingIntent = bookingKeywords.some(w => low.includes(w));
       const foodIntent = foodKeywords.some(w => low.includes(w));
 
-      if (foodIntent && !bookingIntent) {
+      if (foodIntent && intent !== 'booking') {
         await sendWhatsApp(from, "أنا مسؤول هنا عن تنظيم المواعيد بس. تحب أحددلك معاد؟");
         return res.sendStatus(200);
       }
 
-      if (bookingIntent) {
+      if (intent === 'booking') {
         const nowIso = new Date().toISOString();
 
         // حاول نفهم من نفس الرسالة اليوم والساعة لو اتكتبوا في الجملة
@@ -1052,6 +1173,7 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
       let date = session.date;
       let time = session.time;
       let location = session.location;
+      let pendingHour = session.pending_hour;
 
       if (step === 'ask_service') {
         const rawService = text.trim();
@@ -1078,14 +1200,20 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
         const rawPerson = text.trim();
         const rawLow = rawPerson.toLowerCase();
 
-        // لو الرد رفض صريح أو نص مش مفيد (قصير جدًا) نطلب توضيح
-        if (/^لا$/.test(rawLow) || rawPerson.length < 2) {
+        if (/^لا$/.test(rawLow)) {
           const clarifyMsg = await askStepClarifier('person', text);
           await sendWhatsApp(from, clarifyMsg);
           return res.sendStatus(200);
         }
 
-        person = rawPerson;
+        const nameCheck = await validatePersonNameWithLLM(rawPerson);
+        if (!nameCheck.ok) {
+          const msg = nameCheck.message || 'محتاج اسم الشخص اللي نحجزله يكون واضح ومهذب.';
+          await sendWhatsApp(from, msg);
+          return res.sendStatus(200);
+        }
+
+        person = nameCheck.cleanedName || rawPerson;
         // لو التاريخ والساعة كانوا متسجلين من أول رسالة، ما نسألهمش تاني
         if (session.date && session.time) {
           step = 'ask_location';
@@ -1186,6 +1314,32 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
           }
         }
 
+        const hasMorning = /(صباح|الصبح|am)/.test(rawLow);
+        const hasEvening = /(مساء|المساء|ليل|بالليل|pm)/.test(rawLow);
+
+        if (pendingHour && (hasMorning || hasEvening)) {
+          let h = parseInt(String(pendingHour), 10);
+          if (Number.isNaN(h)) {
+            pendingHour = null;
+          } else {
+            if (h <= 12 && hasEvening) {
+              if (h < 12) h += 12;
+            } else if (h === 12 && hasMorning) {
+              h = 0;
+            }
+            const pad = (n) => (n < 10 ? '0' + n : '' + n);
+            time = `${pad(h)}:00`;
+            step = 'ask_location';
+            pendingHour = null;
+            await db.run(
+              `UPDATE whatsapp_sessions SET time = ?, step = ?, pending_hour = NULL, updated_at = ? WHERE id = ?`,
+              [time, step, nowIso, session.id]
+            );
+            await sendWhatsApp(from, "لو حابب تحدد مكان أو فرع معين للمعاد اكتبلي، ولو مش فارق معاك المكان قول مفيش مكان محدد.");
+            return res.sendStatus(200);
+          }
+        }
+
         // لو المستخدم رجع كتب اليوم والساعة معًا هنا، نحاول نفهم الاثنين
         const combinedDate = normalizeUserDate(rawTime);
         const normalizedTime = normalizeUserTime(rawTime);
@@ -1194,8 +1348,9 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
           date = combinedDate.value;
           time = normalizedTime.value;
           step = 'ask_location';
+          pendingHour = null;
           await db.run(
-            `UPDATE whatsapp_sessions SET date = ?, time = ?, step = ?, updated_at = ? WHERE id = ?`,
+            `UPDATE whatsapp_sessions SET date = ?, time = ?, step = ?, pending_hour = NULL, updated_at = ? WHERE id = ?`,
             [date, time, step, nowIso, session.id]
           );
           await sendWhatsApp(from, "لو حابب تحدد مكان أو فرع معين للمعاد اكتبلي، ولو مش فارق معاك المكان قول مفيش مكان محدد.");
@@ -1209,8 +1364,9 @@ app.post("/api/whatsapp/webhook", async (req, res) => {
 
         time = normalizedTime.value;
         step = 'ask_location';
+        pendingHour = null;
         await db.run(
-          `UPDATE whatsapp_sessions SET time = ?, step = ?, updated_at = ? WHERE id = ?`,
+          `UPDATE whatsapp_sessions SET time = ?, step = ?, pending_hour = NULL, updated_at = ? WHERE id = ?`,
           [time, step, nowIso, session.id]
         );
         await sendWhatsApp(from, "لو حابب تحدد مكان أو فرع معين للمعاد اكتبلي، ولو مش فارق معاك المكان قول مفيش مكان محدد.");
