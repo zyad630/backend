@@ -611,317 +611,93 @@ async function sendWhatsApp(to, text) {
   throw lastErr || new Error('sendWhatsApp failed');
 }
 
-// Helper: ask ChatGPT-like assistant for natural Arabic replies
+// Helper: simple rule-based assistant (بدون اتصال بـ OpenAI)
 async function askChatAssistant(userText, extraContext = '') {
-  if (!OPENAI_API_KEY) {
-    throw new Error('OPENAI_API_KEY missing');
+  const text = String(userText || '').trim().toLowerCase();
+
+  if (!text) {
+    return 'محتاج توضحلي طلبك بكلمتين تلاتة عشان أقدر أساعدك.';
   }
 
-  const systemPrompt = `إنت سكرتير خدمة عملاء في مركز خدمات طبية. دورك ترد على رسائل العملاء بشكل طبيعي كأنك موظف بشرى تمامًا.
-
-قواعد الرد:
-- ترد باللهجة المصرية اليومية من غير مبالغة.
-- تكون مهني ومحترم، والجمل قصيرة وواضحة.
-- مفيش أي إيموجي.
-- ما تقولش ولا تلمّح إنك بوت أو مساعد ذكي أو برنامج.
-- لازم ترد على آخر رسالة من العميل بس، وماتفتحش مواضيع من نفسك.
-- مفيش كلمات زي: باشا، فندم، يا غالي، يا نجم، يا معلم… ولا أي لقب مبالغ فيه.
-- ما تبقاش رسمي زيادة عن اللزوم زي: "نود إبلاغ سيادتكم".
-- لو الرسالة تحية (صباح الخير، السلام عليكم، عامل إيه…)، رد طبيعي بسيط.
-- لو الرسالة شكر، رد بسيط زى: "متشكر".
-- لو الرسالة مش واضحة، اطلب توضيح بجملة قصيرة زي: "محتاج توضيح بسيط".
-- لو السؤال طبي، ادّي معلومة عامة بس، ومن غير تشخيص، وقول دايمًا يرجع لدكتور.
-- لو الرسالة عن أكل أو مطاعم، قول: "أنا مسؤول عن تنظيم المواعيد بس. تحب أحددلك معاد؟".
-- ما تقولش إنك سجّلت أو ثبّت معاد، انت بس بتجمع البيانات.
-- ما تتكلمش كأنك صاحب العميل، خليك مهني ولطيف.
-- مفيش أي JSON في الرد.
-
-خلي ردك بسيط ومباشر ومن غير تكلّف، كأنك بتكتب لحد على واتساب من غير ما تفكر كتير.
-
-الهدف:
-ترجع رسالة بشرية طبيعية جدًا، زي سكرتير عادي بيرد على الواتساب.`;
-
-  const userContent = `رسالة العميل: "${userText}"
-سياق إضافي (اختياري): "${extraContext || ''}"`;
-
-  try {
-    const resp = await axios.post(
-      'https://api.openai.com/v1/chat/completions',
-      {
-        model: 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userContent }
-        ],
-        temperature: 0.4,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        timeout: 15000,
-      }
-    );
-
-    const answer = resp.data?.choices?.[0]?.message?.content?.trim() || '';
-    return answer || 'تمام، فهمت عليك. وضّح لي بس نقطة أو نقطتين أكتر علشان أظبط لك الرد.';
-  } catch (err) {
-    console.error('askChatAssistant error', err?.response?.data || err.message);
-    // Fallback to a safe generic reply if OpenAI fails
-    return 'تمام، وصلت رسالتك. حاول تبعتها تاني.';
+  // تحيات بسيطة
+  if (/(صباح الخير|مساء الخير|السلام عليكم|هاي|هلا|اهلا|أهلا)/.test(text)) {
+    return 'أهلاً بيك، إزاي أقدر أساعدك بخصوص المواعيد أو المهام؟';
   }
+
+  // شكر
+  if (/(شكرا|شكرًا|thx|thanks)/.test(text)) {
+    return 'متشكر، تحت أمرك في أي وقت.';
+  }
+
+  // استفسار عام عن الحجز
+  if (/(احجز|حجز|معاد|موعد)/.test(text)) {
+    return 'تقدر تقوللي نوع الخدمة أو الحاجة اللي حابب تحجز لها؟';
+  }
+
+  // لو مش مفهوم
+  if (text.length < 3) {
+    return 'محتاج توضيح بسيط للطلب عشان أفهمك كويس.';
+  }
+
+  // رد عام افتراضي
+  return 'تمام، وصلت رسالتك. لو عايز تحجز معاد أو تسأل عن حاجة في المواعيد وضحلي طلبك.';
 }
 
+// Simple intent classifier بدون LLM
 async function classifyIntentWithLLM(text) {
-  if (!OPENAI_API_KEY) {
-    return { intent: 'rule_based' };
+  const t = String(text || '').trim().toLowerCase();
+
+  if (!t) return { intent: 'other' };
+
+  // booking
+  if (/(احجز|حجز|عايز معاد|موعد|أغير المعاد|تعديل المعاد|ممكن معاد|في مواعيد فاضية)/.test(t)) {
+    return { intent: 'booking' };
   }
 
-  const systemPrompt = `إنت مسؤول عن تصنيف نية رسالة جايالك من عميل واتساب لمركز طبي.
-
-المطلوب:
-- تستقبل نص الرسالة كما هي.
-- ترجع intent واحد فقط من:
-  - "booking" → حجز/تعديل/إلغاء معاد أو سؤال مباشر عن مواعيد أو عن حجز.
-  - "smalltalk" → دردشة عامة، تحية، هزار بسيط، شكر، مجاملة، سؤال عن الحال.
-  - "complaint" → شكوى، تضايق، نقد واضح للخدمة أو الموظفين أو المكان.
-  - "other" → أي حاجة غير اللي فوق (استفسار عام عن الأسعار، الأنظمة، الخدمات، أسئلة عامة).
-
-أمثلة:
-- "عايز أحجز معاد" → booking
-- "عايز أغير معاد بكرة" → booking
-- "في مواعيد فاضية بكرة؟" → booking
-- "صباح الخير، عامل إيه؟" → smalltalk
-- "شكراً ليكم" → smalltalk
-- "الخدمة عندكم سيئة" → complaint
-- "ليه السعر غالي؟" → other
-- "بتقدموا خدمة جلسات؟" → other
-
-الإخراج:
-- رجّع JSON فقط بالشكل:
-  {
-    "intent": "booking" / "smalltalk" / "complaint" / "other"
+  // smalltalk
+  if (/(صباح الخير|مساء الخير|السلام عليكم|ازيك|إزيك|عامل ايه|عامل إيه|شكرا|شكرًا|thx|thanks|اخبارك ايه|أخبارك ايه)/.test(t)) {
+    return { intent: 'smalltalk' };
   }
-- بدون أي شرح إضافي أو كلام زيادة.`;
 
-  const userPrompt = `{
-  "message": "${String(text || '').trim()}"
-}`;
-
-  try {
-    const resp = await axios.post(
-      'https://api.openai.com/v1/chat/completions',
-      {
-        model: 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt }
-        ],
-        temperature: 0,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        timeout: 8000,
-      }
-    );
-
-    const content = resp.data?.choices?.[0]?.message?.content?.trim();
-    try {
-      const parsed = JSON.parse(content);
-      const intent = parsed.intent || 'other';
-      return { intent };
-    } catch {
-      return { intent: 'other' };
-    }
-  } catch (err) {
-    console.error('classifyIntentWithLLM error', err?.response?.data || err.message);
-    return { intent: 'other' };
+  // complaint
+  if (/(سيئة|سئيه|مش راضي|متضايق|خدمة وحشة|تأخير|حدش رد عليا|محدش رد عليا)/.test(t)) {
+    return { intent: 'complaint' };
   }
+
+  return { intent: 'other' };
 }
 
-// Helper: ask LLM for a short clarification question for a specific step
+// Helper: askStepClarifier بدون أي اتصال خارجي
 async function askStepClarifier(step, userText) {
-  if (!OPENAI_API_KEY) {
-    // Fallback generic messages per step
-    if (step === 'service') return 'محتاج أعرف نوع الخدمة أو الاستفسار اللي حابب تحجز له (مثلاً جلسة، استشارة، درس...).';
-    if (step === 'person') return 'محتاج اسم الشخص اللي نحجزله علشان أكمّل الحجز.';
-    if (step === 'date') return 'محتاج اليوم يكون أوضح شوية (مثلاً 15/10 أو السبت الجاي).';
-    if (step === 'time') return 'محتاج الساعة تكون واضحة (مثلاً 5 الصبح أو 7 بالليل).';
-    return 'محتاج توضيح بسيط علشان أكمّل معاك.';
-  }
-
-  const systemPrompt = `إنت مساعد بيصيغ سؤال توضيحي قصير ولطيف في فلو حجز مواعيد.
-
-المطلوب:
-- تاخد نوع الخطوة (service / person / date / time) وآخر رسالة من العميل.
-- ترجع سؤال واحد قصير باللهجة المصرية، مهذب وواضح.
-- ما تغيّرش الموضوع، بس تعيد صياغة الطلب بشكل ألطف.
-- ما تديش أي شروح إضافية.
-
-القواعد لكل نوع:
-- لو step = "service":
-  - اسأل عن نوع الخدمة. مثال: "محتاج توضحلي نوع الخدمة اللي عايزها (مثلاً استشارة، جلسة، متابعة)؟"
-
-- لو step = "person":
-  - اسأل عن اسم الشخص. مثال: "محتاج اسم الشخص اللي هنحجزله (مثلاً أحمد محمد)؟"
-
-- لو step = "date":
-  - اسأل عن اليوم بشكل واضح. مثال: "محتاج اليوم يكون واضح (مثلاً 15/10 أو السبت الجاي)؟"
-
-- لو step = "time":
-  - اسأل عن الساعة بشكل واضح. مثال: "محتاج الساعة تكون واضحة (مثلاً 5 الصبح أو 7 بالليل)؟"
-
-الإخراج:
-- JSON فقط:
-  {
-    "message": "<نص السؤال التوضيحي>"
-  }`;
-
-  const userPrompt = `{
-  "step": "${step}",
-  "lastUserMessage": "${String(userText || '').trim()}"
-}`;
-
-  try {
-    const resp = await axios.post(
-      'https://api.openai.com/v1/chat/completions',
-      {
-        model: 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt }
-        ],
-        temperature: 0.4,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        timeout: 15000,
-      }
-    );
-
-    const content = resp.data?.choices?.[0]?.message?.content?.trim();
-    if (content) {
-      try {
-        const parsed = JSON.parse(content);
-        if (parsed && typeof parsed.message === 'string') return parsed.message;
-      } catch {}
-      return content;
-    }
-  } catch (err) {
-    console.error('askStepClarifier error', err?.response?.data || err.message);
-  }
-
-  // Fallbacks if API failed
-  if (step === 'service') return 'وضحلي نوع الخدمة أو الحاجة اللي حابب تحجز لها.';
-  if (step === 'person') return 'محتاج اسم الشخص اللي نحجزله علشان أسجّل المعاد.';
-  if (step === 'date') return 'محتاج اليوم يكون واضح (مثلاً 15/10 أو السبت الجاي).';
+  if (step === 'service') return 'محتاج أعرف نوع الخدمة أو الاستفسار اللي حابب تحجز له (مثلاً جلسة، استشارة، درس...).';
+  if (step === 'person') return 'محتاج اسم الشخص اللي نحجزله علشان أكمّل الحجز.';
+  if (step === 'date') return 'محتاج اليوم يكون أوضح شوية (مثلاً 15/10 أو السبت الجاي).';
   if (step === 'time') return 'محتاج الساعة تكون واضحة (مثلاً 5 الصبح أو 7 بالليل).';
   return 'محتاج توضيح بسيط علشان أكمّل معاك.';
 }
 
+// validatePersonNameWithLLM بدون LLM: تحقق بسيط
 async function validatePersonNameWithLLM(rawName) {
-  if (!OPENAI_API_KEY) {
-    const trimmed = String(rawName || '').trim();
-    if (trimmed.length < 2) {
-      return {
-        ok: false,
-        cleanedName: null,
-        message: 'محتاج اسم الشخص اللي نحجزله يكون أوضح شوية (مثلاً اسم واحد أو اسمين بالعربي).'
-      };
-    }
-    return { ok: true, cleanedName: trimmed, message: null };
+  const trimmed = String(rawName || '').trim();
+
+  if (trimmed.length < 2) {
+    return {
+      ok: false,
+      cleanedName: null,
+      message: 'محتاج اسم الشخص اللي نحجزله يكون أوضح شوية (مثلاً اسم واحد أو اسمين بالعربي).'
+    };
   }
 
-  const systemPrompt = `إنت مسؤول عن التحقق من صلاحية اسم شخص هنحجزله معاد.
-
-المطلوب:
-- تستقبل rawName (الاسم كما كتبه العميل).
-- تحدد:
-  - ok: true أو false
-  - cleanedName: لو الاسم مقبول ممكن تنضفه شوية (تشيل رموز غريبة أو مسافات زياده) أو تسيبه زي ما هو.
-  - userMessage: لو الاسم غير مقبول، رسالة قصيرة للعميل تطلب اسم مهذب وواضح.
-
-ممنوع:
-- أسماء تهريج واضحة (سوبر مان، البرنس، مش عارف، أي كلام غير جاد).
-- شتائم أو ألفاظ خارجة.
-- جُمل كاملة مش اسم شخص (زي: "احجز لأي حد", "مش مهم", "ابني الصغير").
-
-لو الاسم غير مقبول:
-- ok = false
-- cleanedName = null
-- userMessage = "محتاج اسم الشخص اللي نحجزله يكون واضح ومهذب (مثلاً أحمد محمد)."
-
-لو الاسم مقبول:
-- ok = true
-- cleanedName = نسخة أنضف من الاسم (لو محتاج تعديل بسيط، وإلا سيبه زي ما هو).
-- userMessage = "" (نص فاضي).
-
-الإخراج:
-- JSON فقط:
-  {
-    "ok": true/false,
-    "cleanedName": "<string or null>",
-    "userMessage": "<string>"
-  }`;
-
-  const userPrompt = `{
-  "rawName": "${String(rawName || '').trim()}"
-}`;
-
-  try {
-    const resp = await axios.post(
-      'https://api.openai.com/v1/chat/completions',
-      {
-        model: 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt }
-        ],
-        temperature: 0,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        timeout: 15000,
-      }
-    );
-
-    const content = resp.data?.choices?.[0]?.message?.content?.trim();
-    try {
-      const parsed = JSON.parse(content);
-      return {
-        ok: !!parsed.ok,
-        cleanedName: parsed.cleanedName || null,
-        message: parsed.userMessage || parsed.message || null,
-      };
-    } catch {
-      return {
-        ok: false,
-        cleanedName: null,
-        message: 'محتاج اسم واضح للشخص اللي نحجزله (مثلاً أحمد محمد).',
-      };
-    }
-  } catch (err) {
-    console.error('validatePersonNameWithLLM error', err?.response?.data || err.message);
-    const trimmed = String(rawName || '').trim();
-    if (trimmed.length < 2) {
-      return {
-        ok: false,
-        cleanedName: null,
-        message: 'محتاج اسم واضح للشخص اللي نحجزله (مثلاً أحمد محمد).',
-      };
-    }
-    return { ok: true, cleanedName: trimmed, message: null };
+  // فلتر تهريج بسيط
+  if (/\d/.test(trimmed) || /(هههه|lol|test|سوبر مان|البرنس)/i.test(trimmed)) {
+    return {
+      ok: false,
+      cleanedName: null,
+      message: 'حاول تكتب اسم شخص حقيقي وواضح (مثلاً أحمد محمد).'
+    };
   }
+
+  return { ok: true, cleanedName: trimmed, message: null };
 }
 
 // Helper: reminder text templates based on reminder_count (0 = first reminder)
